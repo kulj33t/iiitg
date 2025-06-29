@@ -1,90 +1,107 @@
-import random
-import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
 from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-SEED = 21
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-
 iris = load_iris()
-X = iris.data[:, :2]
+X = iris.data
 y = iris.target
 
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-idx = 0
-x0 = torch.tensor(X_scaled[idx], dtype=torch.float32, requires_grad=True)
-target_class = torch.tensor([y[idx]])
+X_train, _, y_train, _ = train_test_split(X_scaled, y, test_size=0.2, random_state=42, stratify=y)
+
+X_train = torch.tensor(X_train, dtype=torch.float32)
+y_train = torch.tensor(y_train, dtype=torch.long)
 
 class MLP(nn.Module):
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2, 6),
+        self.model = nn.Sequential(
+            nn.Linear(4, 6),
             nn.ReLU(),
             nn.Linear(6, 3)
         )
-
     def forward(self, x):
-        return self.net(x)
+        return self.model(x)
 
 model = MLP()
 criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
-def generate_loss_surface(model, grid_x, grid_y, target_class):
-    Xg, Yg = np.meshgrid(grid_x, grid_y)
-    Z = np.zeros_like(Xg)
+def flatten_params(model):
+    return torch.cat([p.flatten() for p in model.parameters() if p.requires_grad])
 
-    for i in range(Xg.shape[0]):
-        for j in range(Xg.shape[1]):
-            pt = torch.tensor([[Xg[i, j], Yg[i, j]]], dtype=torch.float32)
-            out = model(pt)
-            loss = criterion(out, target_class)
-            Z[i, j] = loss.item()
+def set_weights_from_flat(model, flat_vector):
+    offset = 0
+    for p in model.parameters():
+        if p.requires_grad:
+            numel = p.numel()
+            p.data.copy_(flat_vector[offset:offset + numel].view_as(p))
+            offset += numel
 
-    return Xg, Yg, Z
+torch.manual_seed(0)
+w0 = flatten_params(model).detach()
+d1 = torch.randn_like(w0); d1 /= torch.norm(d1)
+d2 = torch.randn_like(w0); d2 /= torch.norm(d2)
 
-def plot_moving_point(Xg, Yg, Z, point, loss_val, step):
-    plt.figure(figsize=(8, 6))
-    contour = plt.contourf(Xg, Yg, Z, levels=40, cmap='turbo')
-    plt.plot(point[0], point[1], 'ro', markersize=8, label=f'Loss: {loss_val:.4f}')
-    plt.title(f"Gradient Descent - Step {step}")
-    plt.xlabel("Feature 1")
-    plt.ylabel("Feature 2")
-    plt.colorbar(contour, label='Loss')
-    plt.xlim(Xg.min(), Xg.max())
-    plt.ylim(Yg.min(), Yg.max())
-    plt.grid(True)
-    plt.legend()
-    # plt.savefig(f"vid/step_{step:03d}.png")
-    plt.show()
-    plt.close()
+alpha_range = np.linspace(-3.0, 3.0, 150)
+beta_range = np.linspace(-3.0, 3.0, 150)
+ALPHA, BETA = np.meshgrid(alpha_range, beta_range)
 
-def gradient_descent_moving_point(model, x_start, steps, lr, box_size, resolution):
-    x = x_start.clone().detach().requires_grad_(True)
-    center = x_start.detach().numpy()
-
-    grid_x = np.linspace(center[0] - box_size, center[0] + box_size, resolution)
-    grid_y = np.linspace(center[1] - box_size, center[1] + box_size, resolution)
-    Xg, Yg, Z = generate_loss_surface(model, grid_x, grid_y, target_class)
-
-    for step in range(steps):
-        out = model(x.unsqueeze(0))
-        loss = criterion(out, target_class)
-        current_pos = x.clone().detach().numpy()
-        plot_moving_point(Xg, Yg, Z, current_pos, loss.item(), step)
-
-        loss.backward()
+initial_w = flatten_params(model).detach()
+LOSS_INIT = np.zeros_like(ALPHA)
+for i in range(ALPHA.shape[0]):
+    for j in range(ALPHA.shape[1]):
+        w_test = initial_w + ALPHA[i, j] * d1 + BETA[i, j] * d2
+        set_weights_from_flat(model, w_test)
         with torch.no_grad():
-            x -= lr * x.grad
-        x.grad.zero_()
+            LOSS_INIT[i, j] = criterion(model(X_train), y_train).item()
 
-gradient_descent_moving_point(model, x_start=x0, steps=100, lr=0.05, box_size=1.0, resolution=100)
+loss_min, loss_max = LOSS_INIT.min(), LOSS_INIT.max()
 
+plt.ion()
+for epoch in range(10):
+    optimizer.zero_grad()
+    loss = criterion(model(X_train), y_train)
+    loss.backward()
+    optimizer.step()
+
+    w_curr = flatten_params(model).detach()
+    LOSS = np.zeros_like(ALPHA)
+    for i in range(ALPHA.shape[0]):
+        for j in range(ALPHA.shape[1]):
+            w_test = w_curr + ALPHA[i, j] * d1 + BETA[i, j] * d2
+            set_weights_from_flat(model, w_test)
+            with torch.no_grad():
+                LOSS[i, j] = criterion(model(X_train), y_train).item()
+    set_weights_from_flat(model, w_curr)
+
+    plt.figure(figsize=(8, 6))
+    im = plt.imshow(
+        LOSS,
+        extent=[alpha_range[0], alpha_range[-1], beta_range[0], beta_range[-1]],
+        origin='lower',
+        cmap='turbo',
+        aspect='auto',
+        vmin=loss_min,
+        vmax=loss_max,
+        interpolation='nearest'
+    )
+    plt.colorbar(im, label='Loss')
+    plt.plot(0, 0, 'ro', markersize=10, label=f'Loss = {loss.item():.4f}')
+    plt.title(f"Epoch {epoch+1}")
+    plt.xlabel("Alpha (direction d1)")
+    plt.ylabel("Beta (direction d2)")
+    plt.legend()
+    plt.grid(False)
+    plt.pause(0.15)
+    plt.clf()
+
+plt.ioff()
+plt.close()
 
